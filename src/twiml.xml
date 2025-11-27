@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Connected</Say>
+  <Connect>
+    <Stream url="{{WS_URL}}">
+      <Parameter name="session_id" value="{{SESSION_ID}}" />
+      <Parameter name="customer" value="{{CUSTOMER}}" />
+      <Parameter name="code" value="{{CODE}}" />
+    </Stream>
+  </Connect>
+  <Say>Disconnected</Say>
+</Response>
