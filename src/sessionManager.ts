@@ -356,11 +356,12 @@ async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessio
   let remoteConfig: any = {};
   try {
     const response = await fetch(
-      `http://localhost:3004/v1/1/tenants/1/agent/${agentCode}/config`,
+      `https://api-acharya.revoft.com/acharya/engine/v1/${customerId}/tenants/1/agent/${agentCode}/config`,
       {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.ACHARYA_API_KEY}`,
         },
       }
     );
