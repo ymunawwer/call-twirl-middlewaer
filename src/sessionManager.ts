@@ -19,6 +19,36 @@ interface Session {
 
 let session: Session = {};
 
+// Simple in-memory cache for remote agent configs
+// version is optional and comes from Acharya response if provided
+type AgentConfigCacheEntry = { config: any; fetchedAt: number; version?: string };
+const agentConfigCache = new Map<string, AgentConfigCacheEntry>();
+const AGENT_CONFIG_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+
+
+export function invalidateAgentConfig(agentCode: string, customerId?: string) {
+  if (customerId) {
+    const key = `${customerId}:${agentCode}`;
+    agentConfigCache.delete(key);
+    console.log("[CACHE] Invalidated agent config", { customerId, agentCode });
+    return;
+  }
+
+  // If customerId not provided, clear all entries for this agentCode
+  let removed = 0;
+  for (const key of agentConfigCache.keys()) {
+    if (key.endsWith(`:${agentCode}`)) {
+      agentConfigCache.delete(key);
+      removed++;
+    }
+  }
+  console.log("[CACHE] Invalidated agent config by agentCode", {
+    agentCode,
+    removed,
+  });
+}
+
 export function handleCallConnection(ws: WebSocket, openAIApiKey: string) {
   cleanupConnection(session.twilioConn);
   session.twilioConn = ws;
@@ -353,10 +383,15 @@ function closeAllConnections() {
 }
 
 async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessionId:string): Promise<any> {
+  const cacheKey = `${customerId}:${agentCode}`;
+  const cached = agentConfigCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < AGENT_CONFIG_TTL_MS) {
+    return cached.config;
+  }
   let remoteConfig: any = {};
   try {
     const response = await fetch(
-      `https://api-acharya.revoft.com/acharya/engine/v1/${customerId}/tenants/1/agent/${agentCode}/config`,
+      `https://api-acharya.revoft.com/acharya/engine/v1/${"customerId"}/tenants/1/agent/${agentCode}/config`,
       {
         method: "GET",
         headers: {
@@ -387,6 +422,18 @@ async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessio
         client_id: data.clientId || data.fullConfig?.context?.clientId,
         agent_id: data.agentId || data.fullConfig?.context?.agentId,
       };
+
+      // Try to capture a version marker from Acharya payload if present
+      const version: string | undefined =
+        (data as any).version ||
+        (data.fullConfig as any)?.version ||
+        (data.fullConfig as any)?.context?.version;
+
+      agentConfigCache.set(cacheKey, {
+        config: remoteConfig,
+        fetchedAt: Date.now(),
+        version,
+      });
     }
   } catch (err) {
     console.error("Failed to fetch remote agent config", err);

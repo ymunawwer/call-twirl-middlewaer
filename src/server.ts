@@ -11,6 +11,7 @@ import { CallLog } from "./models/CallLog";
 import {
   handleCallConnection,
   handleFrontendConnection,
+  invalidateAgentConfig,
 } from "./sessionManager";
 import functions from "./functionHandlers";
 
@@ -38,6 +39,7 @@ mongoose
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
@@ -48,6 +50,16 @@ const twimlTemplate = readFileSync(twimlPath, "utf-8");
 
 app.get("/public-url", (req, res) => {
   res.json({ publicUrl: PUBLIC_URL });
+});
+
+// Invalidate in-memory agent config cache when Acharya config is updated
+app.post("/agent-config/invalidate", (req:any, res:any) => {
+  const { agentCode, customerId } = req.body || {};
+  if (!agentCode) {
+    return res.status(400).json({ error: "agentCode is required" });
+  }
+  invalidateAgentConfig(agentCode, customerId);
+  res.json({ status: "ok" });
 });
 
 app.all("/twiml", async (req, res) => {
