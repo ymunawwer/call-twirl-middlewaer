@@ -85,7 +85,7 @@ app.all("/twiml", async (req, res) => {
     .replace("{{WS_URL}}", wsUrl.toString())
     .replace("{{SESSION_ID}}", sessionId)
     .replace("{{CUSTOMER}}", customer)
-    .replace("{{CODE}}", agentCode);
+    .replace("{{CODE}}", agentCode.toString());
   res.type("text/xml").send(twimlContent);
 });
 
