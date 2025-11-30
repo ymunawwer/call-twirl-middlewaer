@@ -17,7 +17,7 @@ import functions from "./functionHandlers";
 
 dotenv.config();
 
-const PORT = parseInt(process.env.PORT || "8081", 10);
+const PORT = parseInt(process.env.PORT || "8080", 10);
 const PUBLIC_URL = process.env.PUBLIC_URL || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MONGODB_URI =
