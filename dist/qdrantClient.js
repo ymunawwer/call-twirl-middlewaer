@@ -14,11 +14,15 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.storeMemory = storeMemory;
 exports.searchMemory = searchMemory;
+exports.storeKnowledge = storeKnowledge;
+exports.searchKnowledge = searchKnowledge;
 const dotenv_1 = __importDefault(require("dotenv"));
+const crypto_1 = require("crypto");
 dotenv_1.default.config();
-const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
+const QDRANT_URL = process.env.QDRANT_URL || "http://20.115.57.237:6333";
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY || "";
 const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION || "conversation_memory";
+const QDRANT_KNOWLEDGE_COLLECTION = process.env.QDRANT_KNOWLEDGE_COLLECTION || "product_knowledge";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 if (!OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY environment variable is required for embeddings");
@@ -32,10 +36,12 @@ function qdrantRequest(path_1) {
         if (QDRANT_API_KEY) {
             headers["api-key"] = QDRANT_API_KEY;
         }
-        const res = yield fetch(`${QDRANT_URL}${path}`, Object.assign(Object.assign({}, init), { headers: Object.assign(Object.assign({}, headers), init.headers) }));
+        const url = `${QDRANT_URL}${path}`;
+        const res = yield fetch(url, Object.assign(Object.assign({}, init), { headers: Object.assign(Object.assign({}, headers), init.headers) }));
         if (!res.ok) {
             const text = yield res.text();
-            throw new Error(`Qdrant request failed: ${res.status} ${text}`);
+            console.error("[QDRANT] Request failed", { url, status: res.status, text });
+            throw new Error(`Qdrant request failed: ${res.status}`);
         }
         return res.json();
     });
@@ -44,7 +50,25 @@ function ensureCollection() {
     return __awaiter(this, void 0, void 0, function* () {
         yield qdrantRequest(`/collections/${QDRANT_COLLECTION}`)
             .catch(() => __awaiter(this, void 0, void 0, function* () {
+            console.log("[QDRANT] Creating collection", QDRANT_COLLECTION);
             yield qdrantRequest(`/collections/${QDRANT_COLLECTION}`, {
+                method: "PUT",
+                body: JSON.stringify({
+                    vectors: {
+                        size: VECTOR_SIZE,
+                        distance: "Cosine",
+                    },
+                }),
+            });
+        }));
+    });
+}
+function ensureKnowledgeCollection() {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield qdrantRequest(`/collections/${QDRANT_KNOWLEDGE_COLLECTION}`)
+            .catch(() => __awaiter(this, void 0, void 0, function* () {
+            console.log("[QDRANT] Creating knowledge collection", QDRANT_KNOWLEDGE_COLLECTION);
+            yield qdrantRequest(`/collections/${QDRANT_KNOWLEDGE_COLLECTION}`, {
                 method: "PUT",
                 body: JSON.stringify({
                     vectors: {
@@ -86,7 +110,7 @@ function storeMemory(payload) {
     return __awaiter(this, void 0, void 0, function* () {
         yield ensureCollection();
         const vector = yield embedText(payload.text);
-        const pointId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const pointId = (0, crypto_1.randomUUID)(); //`${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const body = {
             points: [
                 {
@@ -96,6 +120,10 @@ function storeMemory(payload) {
                 },
             ],
         };
+        console.log("[QDRANT] storeMemory", {
+            id: pointId,
+            hasMetadata: !!payload.metadata,
+        });
         yield qdrantRequest(`/collections/${QDRANT_COLLECTION}/points`, {
             method: "PUT",
             body: JSON.stringify(body),
@@ -129,7 +157,69 @@ function searchMemory(payload) {
         if (must.length > 0) {
             body.filter = { must };
         }
+        console.log("[QDRANT] searchMemory", {
+            top_k: limit,
+            client_id: payload.client_id,
+            agent_id: payload.agent_id,
+        });
         const res = yield qdrantRequest(`/collections/${QDRANT_COLLECTION}/points/search`, {
+            method: "POST",
+            body: JSON.stringify(body),
+        });
+        return (res === null || res === void 0 ? void 0 : res.result) || [];
+    });
+}
+function storeKnowledge(payload) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield ensureKnowledgeCollection();
+        const vector = yield embedText(payload.text);
+        const pointId = (0, crypto_1.randomUUID)();
+        const body = {
+            points: [
+                {
+                    id: pointId,
+                    vector,
+                    payload: Object.assign({ text: payload.text }, (payload.metadata || {})),
+                },
+            ],
+        };
+        console.log("[QDRANT] storeKnowledge", {
+            id: pointId,
+            hasMetadata: !!payload.metadata,
+        });
+        yield qdrantRequest(`/collections/${QDRANT_KNOWLEDGE_COLLECTION}/points`, {
+            method: "PUT",
+            body: JSON.stringify(body),
+        });
+        return { id: pointId };
+    });
+}
+function searchKnowledge(payload) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield ensureKnowledgeCollection();
+        const vector = yield embedText(payload.query);
+        const limit = payload.top_k || 5;
+        const must = [];
+        if (payload.product_id) {
+            must.push({ key: "product_id", match: { value: payload.product_id } });
+        }
+        if (payload.company_id) {
+            must.push({ key: "company_id", match: { value: payload.company_id } });
+        }
+        const body = {
+            vector,
+            limit,
+            with_payload: true,
+        };
+        if (must.length > 0) {
+            body.filter = { must };
+        }
+        console.log("[QDRANT] searchKnowledge", {
+            top_k: limit,
+            product_id: payload.product_id,
+            company_id: payload.company_id,
+        });
+        const res = yield qdrantRequest(`/collections/${QDRANT_KNOWLEDGE_COLLECTION}/points/search`, {
             method: "POST",
             body: JSON.stringify(body),
         });
