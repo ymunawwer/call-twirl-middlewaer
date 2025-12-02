@@ -3,6 +3,8 @@ import dotenv from "dotenv";
 import functions from "./functionHandlers";
 import { CallEventLog } from "./models/CallEventLog";
 
+import Redis from "ioredis";
+
 dotenv.config();
 
 interface Session {
@@ -19,18 +21,35 @@ interface Session {
 
 let session: Session = {};
 
-// Simple in-memory cache for remote agent configs
-// version is optional and comes from Acharya response if provided
 type AgentConfigCacheEntry = { config: any; fetchedAt: number; version?: string };
 const agentConfigCache = new Map<string, AgentConfigCacheEntry>();
-const AGENT_CONFIG_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const AGENT_CONFIG_TTL_MS = 24 * 60 * 60 * 1000;
 
+const redisClient = new Redis({
+  host: process.env.AZURE_REDIS_URL,
+  port: 10000,
+  password: process.env.AZURE_REDIS_PK,
+  tls: {}  // TLS is required for Azure
+});
 
+redisClient.on("connect", () => {
+  console.log("Connected to Azure Redis!");
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
 
 export function invalidateAgentConfig(agentCode: string, customerId?: string) {
   if (customerId) {
     const key = `${customerId}:${agentCode}`;
     agentConfigCache.delete(key);
+    if (redisClient.status === "ready") {
+      const redisKey = `agent-config:${key}`;
+      redisClient.del(redisKey).catch((err:any) => {
+        console.error("[REDIS] Failed to delete agent config key", { redisKey, err });
+      });
+    }
     console.log("[CACHE] Invalidated agent config", { customerId, agentCode });
     return;
   }
@@ -40,6 +59,12 @@ export function invalidateAgentConfig(agentCode: string, customerId?: string) {
   for (const key of agentConfigCache.keys()) {
     if (key.endsWith(`:${agentCode}`)) {
       agentConfigCache.delete(key);
+      if (redisClient.status === "ready") {
+        const redisKey = `agent-config:${key}`;
+        redisClient.del(redisKey).catch((err:any) => {
+          console.error("[REDIS] Failed to delete agent config key", { redisKey, err });
+        });
+      }
       removed++;
     }
   }
@@ -56,7 +81,7 @@ export function handleCallConnection(ws: WebSocket, openAIApiKey: string) {
   console.log("[CALL] New Twilio call WebSocket connected");
 
   ws.on("message", handleTwilioMessage);
-  ws.on("error", (err) => {
+  ws.on("error", (err:any) => {
     console.error("[CALL] Twilio WebSocket error", err);
     ws.close();
   });
@@ -384,6 +409,20 @@ function closeAllConnections() {
 
 async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessionId:string): Promise<any> {
   const cacheKey = `${customerId}:${agentCode}`;
+  const redisKey = `agent-config:${cacheKey}`;
+
+  try {
+    if (redisClient.status === "ready") {
+      const cachedStr = await redisClient.get(redisKey);
+      if (cachedStr) {
+        const parsed = JSON.parse(cachedStr);
+        return parsed;
+      }
+    }
+  } catch (err) {
+    console.error("[REDIS] Failed to read agent config from cache", { redisKey, err });
+  }
+
   const cached = agentConfigCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < AGENT_CONFIG_TTL_MS) {
     return cached.config;
@@ -391,7 +430,88 @@ async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessio
   let remoteConfig: any = {};
   try {
     const response = await fetch(
-      `https://api-acharya.revoft.com/acharya/engine/v1/${"customerId"}/tenants/1/agent/${agentCode}/config`,
+      `https://api-acharya.revoft.com/acharya/engine/v1/${customerId}/tenants/1/agent/${agentCode}/config`,
+      {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.ACHARYA_API_KEY}`,
+        },
+      }
+    );
+    if (response.ok) {
+      const json = await response.json();
+      const data = json?.data || {};
+
+      // agentSystemPrompt / fullConfig.context.systemPrompt come back as quoted strings
+      const rawPrompt =
+        data.agentSystemPrompt || data.fullConfig?.context?.systemPrompt;
+      let instructions = rawPrompt;
+      if (typeof instructions === "string") {
+        
+        // strip leading/trailing quotes if present
+        instructions = instructions.replace(/^\"|\"$/g, "");
+        instructions = instructions.replace("Aisha",data.fullConfig?.personality)
+        instructions = instructions.replace("{NAME}",data.fullConfig?.personality)
+        instructions = instructions.replace("{GENDER}",data.fullConfig?.gender)
+        instructions = instructions.replace("{TONE}",data.fullConfig?.tone)
+        instructions = instructions.replace("{LANGUAGE}",data.fullConfig?.language)
+        // instructions = instructions.replace("${agentName}", data.fullConfig?.personality+ " who speaks in "+data.fullConfig?.language+` and clientID is ${customerId},agentID is ${agentCode}.`);
+     instructions = `clientID is ${customerId} which is company code and should not revealed any info related to it,agentID is ${agentCode} similarly agentID is confidential. ${instructions}`;
+      }
+
+      remoteConfig = {
+        instructions,
+        voice: data.voice || data.fullConfig?.context?.voice,
+        client_id: data.clientId || data.fullConfig?.context?.clientId,
+        agent_id: data.agentId || data.fullConfig?.context?.agentId,
+      };
+
+      // Try to capture a version marker from Acharya payload if present
+      const version: string | undefined =
+        (data as any).version ||
+        (data.fullConfig as any)?.version ||
+        (data.fullConfig as any)?.context?.version;
+
+      const entry: AgentConfigCacheEntry = {
+        config: remoteConfig,
+        fetchedAt: Date.now(),
+        version,
+      };
+
+      agentConfigCache.set(cacheKey, entry);
+
+      if (redisClient.status === "ready") {
+        try {
+          await redisClient.set(
+            redisKey,
+            JSON.stringify(entry.config),
+            "EX",
+            AGENT_CONFIG_TTL_MS / 1000
+          );
+        } catch (err) {
+          console.error("[REDIS] Failed to write agent config to cache", { redisKey, err });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Failed to fetch remote agent config", err);
+  }
+
+  return remoteConfig || {};
+}
+
+
+async function fetchRemoteCustomerDetails(agentCode: string,customerId:string,sessionId:string): Promise<any> {
+  const cacheKey = `${customerId}:${agentCode}`;
+  const cached = agentConfigCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < AGENT_CONFIG_TTL_MS) {
+    return cached.config;
+  }
+  let remoteConfig: any = {};
+  try {
+    const response = await fetch(
+      `http://localhost:3001/v1/crm/customer/${customerId}`,
       {
         method: "GET",
         headers: {
@@ -441,6 +561,7 @@ async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessio
 
   return remoteConfig || {};
 }
+
 
 function cleanupConnection(ws?: WebSocket) {
   if (isOpen(ws)) ws.close();
