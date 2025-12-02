@@ -223,13 +223,13 @@ function tryConnectModel(parameters:any) {
     const config = session.saved_config || {};
     const remoteConfig = await fetchRemoteAgentConfig(parameters?.code,parameters?.customer,parameters?.session_id);
     // const remoteConfig:any = {};
-
+console.log(remoteConfig);
     const instructions =
       remoteConfig.instructions ||
       process.env.AGENT_SYSTEM_PROMPT ||
       "Your Name is john. You are a realtime voice assistant with tool and memory access.Always speak in Hindi and Proactively use available tools (including vector memory search and storage) to help the user. Keep responses concise, speak naturally, and retrieve relevant memories before answering complex or contextual questions. When you call store_memory or search_memory, always pass client_id and agent_id so that memories are partitioned and retrieved per client and agent persona.";
 
-    const voice = /*remoteConfig.voice  ||*/"ash";
+    const voice = remoteConfig.voice  || "ash";
     const clientId = remoteConfig.client_id || (config as any).client_id || "client-1";
     const agentId =
       remoteConfig.agent_id || (config as any).agent_id || "sales_agent";
@@ -439,6 +439,7 @@ async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessio
         },
       }
     );
+    console.log("response",response);
     if (response.ok) {
       const json = await response.json();
       const data = json?.data || {};
