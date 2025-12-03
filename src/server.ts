@@ -7,6 +7,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import cors from "cors";
 import mongoose from "mongoose";
+import { randomUUID } from "crypto";
 import { CallLog } from "./models/CallLog";
 import {
   handleCallConnection,
@@ -149,7 +150,7 @@ wss.on("connection", (ws: WebSocket, req: any) => {
   }
 
   const type = parts[0];
-  const sessionId = url.searchParams.get("session_id") || "session-default";
+  const sessionId = url.searchParams.get("session_id") || randomUUID();
   const customer = url.searchParams.get("customer") || "customer-default";
   const agentCode = url.searchParams.get("code") || "agent-code-default";
 
