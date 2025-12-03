@@ -7,10 +7,11 @@ import Redis from "ioredis";
 
 dotenv.config();
 
-interface Session {
+interface CallSession {
   twilioConn?: WebSocket;
   frontendConn?: WebSocket;
   modelConn?: WebSocket;
+  vonageConn?: WebSocket;
   streamSid?: string;
   saved_config?: any;
   lastAssistantItem?: string;
@@ -18,8 +19,24 @@ interface Session {
   latestMediaTimestamp?: number;
   openAIApiKey?: string;
 }
+const sessions = new Map<string, CallSession>();
 
-let session: Session = {};
+function getOrCreateSession(sessionId: string): CallSession {
+  let s = sessions.get(sessionId);
+  if (!s) {
+    s = {};
+    sessions.set(sessionId, s);
+  }
+  return s;
+}
+
+function deleteSessionIfEmpty(sessionId: string) {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  if (!s.twilioConn && !s.vonageConn && !s.frontendConn && !s.modelConn) {
+    sessions.delete(sessionId);
+  }
+}
 
 type AgentConfigCacheEntry = { config: any; fetchedAt: number; version?: string };
 const agentConfigCache = new Map<string, AgentConfigCacheEntry>();
@@ -74,13 +91,50 @@ export function invalidateAgentConfig(agentCode: string, customerId?: string) {
   });
 }
 
-export function handleCallConnection(ws: WebSocket, openAIApiKey: string) {
+export function handleVonageConnection(
+  ws: WebSocket,
+  openAIApiKey: string,
+  meta: { customer?: string; code?: string; sessionId: string }
+) {
+  const session = getOrCreateSession(meta.sessionId);
+  cleanupConnection(session.vonageConn);
+  session.vonageConn = ws;
+  session.openAIApiKey = openAIApiKey;
+  session.streamSid = meta.sessionId;
+
+  ws.on("message", (data) => handleVonageMessage(meta.sessionId, data));
+  ws.on("error", (err: any) => {
+    console.error("[VONAGE] WebSocket error", err);
+    ws.close();
+  });
+  ws.on("close", () => {
+    console.log("[VONAGE] WebSocket closed");
+    cleanupConnection(session.modelConn);
+    cleanupConnection(session.vonageConn);
+    session.vonageConn = undefined;
+    session.modelConn = undefined;
+    deleteSessionIfEmpty(meta.sessionId);
+  });
+
+  tryConnectModel(meta.sessionId, {
+    customer: meta.customer,
+    code: meta.code,
+    session_id: meta.sessionId,
+  });
+}
+
+export function handleCallConnection(
+  ws: WebSocket,
+  openAIApiKey: string,
+  meta: { sessionId: string; customer?: string; code?: string }
+) {
+  const session = getOrCreateSession(meta.sessionId);
   cleanupConnection(session.twilioConn);
   session.twilioConn = ws;
   session.openAIApiKey = openAIApiKey;
   console.log("[CALL] New Twilio call WebSocket connected");
 
-  ws.on("message", handleTwilioMessage);
+  ws.on("message", (data) => handleTwilioMessage(meta.sessionId, data));
   ws.on("error", (err:any) => {
     console.error("[CALL] Twilio WebSocket error", err);
     ws.close();
@@ -95,21 +149,22 @@ export function handleCallConnection(ws: WebSocket, openAIApiKey: string) {
     session.lastAssistantItem = undefined;
     session.responseStartTimestamp = undefined;
     session.latestMediaTimestamp = undefined;
-    if (!session.frontendConn) session = {};
+    deleteSessionIfEmpty(meta.sessionId);
   });
 }
 
-export function handleFrontendConnection(ws: WebSocket) {
+export function handleFrontendConnection(ws: WebSocket, meta: { sessionId: string }) {
+  const session = getOrCreateSession(meta.sessionId);
   cleanupConnection(session.frontendConn);
   session.frontendConn = ws;
   console.log("[FRONTEND] Logs WebSocket connected");
 
-  ws.on("message", handleFrontendMessage);
+  ws.on("message", (data) => handleFrontendMessage(meta.sessionId, data));
   ws.on("close", () => {
     console.log("[FRONTEND] Logs WebSocket closed");
     cleanupConnection(session.frontendConn);
     session.frontendConn = undefined;
-    if (!session.twilioConn && !session.modelConn) session = {};
+    deleteSessionIfEmpty(meta.sessionId);
   });
 }
 
@@ -141,7 +196,9 @@ async function handleFunctionCall(item: { name: string; arguments: string }) {
   }
 }
 
-function handleTwilioMessage(data: RawData) {
+function handleTwilioMessage(sessionId: string, data: RawData) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   const msg = parseMessage(data);
   if (!msg) return;
 if(msg.event === 'start' || msg.event==='close')
@@ -160,7 +217,7 @@ if(msg.event === 'start' || msg.event==='close')
       session.latestMediaTimestamp = 0;
       session.lastAssistantItem = undefined;
       session.responseStartTimestamp = undefined;
-      tryConnectModel(msg.start?.customParameters);
+      tryConnectModel(sessionId, msg.start?.customParameters || {});
       break;
     case "media":
       session.latestMediaTimestamp = msg.media.timestamp;
@@ -173,12 +230,14 @@ if(msg.event === 'start' || msg.event==='close')
       break;
     case "close":
       console.log("[CALL] Twilio stream close event received");
-      closeAllConnections();
+      closeAllConnections(sessionId);
       break;
   }
 }
 
-function handleFrontendMessage(data: RawData) {
+function handleFrontendMessage(sessionId: string, data: RawData) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   const msg = parseMessage(data);
   if (!msg) return;
 
@@ -199,9 +258,10 @@ function handleFrontendMessage(data: RawData) {
   }
 }
 
-function tryConnectModel(parameters:any) {
-  if (!session.twilioConn || !session.streamSid || !session.openAIApiKey)
-    return;
+function tryConnectModel(sessionId: string, parameters: any) {
+  const session = getOrCreateSession(sessionId);
+  const hasTelephonyConn = !!session.twilioConn || !!session.vonageConn;
+  if (!hasTelephonyConn || !session.streamSid || !session.openAIApiKey) return;
   if (isOpen(session.modelConn)) return;
   console.log("[MODEL] Connecting to OpenAI realtime", {
     hasApiKey: !!session.openAIApiKey,
@@ -241,6 +301,8 @@ console.log(remoteConfig);
       instructionsSnippet: instructions.slice(0, 120),
     });
 
+    const usingVonage = !!session.vonageConn && !session.twilioConn;
+
     jsonSend(session.modelConn, {
       type: "session.update",
       session: {
@@ -248,14 +310,13 @@ console.log(remoteConfig);
         turn_detection: { type: "server_vad" },
         voice,
         input_audio_transcription: { model: "whisper-1" },
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
+        input_audio_format: usingVonage ? "pcm16" : "g711_ulaw",
+        output_audio_format: usingVonage ? "pcm16" : "g711_ulaw",
         instructions,
-       
+        
         tools: functions.map((f) => f.schema),
         ...config,
-      }
-    
+      },
     });
 
     // jsonSend(session.modelConn, {
@@ -273,36 +334,38 @@ console.log(remoteConfig);
     // });
   });
 
-  session.modelConn.on("message", handleModelMessage);
+  session.modelConn.on("message", (data) => handleModelMessage(sessionId, data));
   session.modelConn.on("error", (err) => {
     console.error("[MODEL] Error on OpenAI realtime WebSocket", err);
-    closeModel(err);
+    closeModel(sessionId, err);
   });
   session.modelConn.on("close", (code, reason) => {
     console.log("[MODEL] OpenAI realtime WebSocket closed", { code, reason: reason.toString() });
-    closeModel(undefined);
+    closeModel(sessionId);
   });
 }
 
-function handleModelMessage(data: RawData) {
+function handleModelMessage(sessionId: string, data: RawData) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   const event = parseMessage(data);
   if (!event) return;
 
-  // Forward all model events to frontend logs connection
+  // Forward all model events to this session's frontend logs connection
   jsonSend(session.frontendConn, event);
 
   switch (event.type) {
     case "input_audio_buffer.speech_started":
-      handleTruncation();
+      handleTruncation(sessionId);
       break;
 
     case "response.audio.delta":
-      if (session.twilioConn && session.streamSid) {
-        if (session.responseStartTimestamp === undefined) {
-          session.responseStartTimestamp = session.latestMediaTimestamp || 0;
-        }
-        if (event.item_id) session.lastAssistantItem = event.item_id;
-
+      if (!(session.twilioConn || session.vonageConn) || !session.streamSid) break;
+      if (session.responseStartTimestamp === undefined) {
+        session.responseStartTimestamp = session.latestMediaTimestamp || 0;
+      }
+      if (event.item_id) session.lastAssistantItem = event.item_id;
+      if (session.twilioConn) {
         jsonSend(session.twilioConn, {
           event: "media",
           streamSid: session.streamSid,
@@ -313,6 +376,11 @@ function handleModelMessage(data: RawData) {
           event: "mark",
           streamSid: session.streamSid,
         });
+      } else if (session.vonageConn) {
+        const audioBuffer = Buffer.from(event.delta, "base64");
+        if (isOpen(session.vonageConn)) {
+          session.vonageConn.send(audioBuffer);
+        }
       }
       break;
 
@@ -334,7 +402,7 @@ function handleModelMessage(data: RawData) {
               jsonSend(session.modelConn, { type: "response.create" });
               if (item.name === "end_call") {
                 console.log("[CALL] end_call tool invoked, closing all connections");
-                closeAllConnections();
+                closeAllConnections(sessionId);
               }
             }
           })
@@ -347,7 +415,9 @@ function handleModelMessage(data: RawData) {
   }
 }
 
-function handleTruncation() {
+function handleTruncation(sessionId: string) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   if (
     !session.lastAssistantItem ||
     session.responseStartTimestamp === undefined
@@ -378,19 +448,29 @@ function handleTruncation() {
   session.responseStartTimestamp = undefined;
 }
 
-function closeModel(err:any) {
+function closeModel(sessionId: string, err?: any) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   if (err) {
     console.error("[MODEL] Error in model connection", err);
   }
-  cleanupConnection(session.modelConn);
-  session.modelConn = undefined;
-  if (!session.twilioConn && !session.frontendConn) session = {};
+  if (session.modelConn) {
+    cleanupConnection(session.modelConn);
+    session.modelConn = undefined;
+  }
+  deleteSessionIfEmpty(sessionId);
 }
 
-function closeAllConnections() {
+function closeAllConnections(sessionId: string) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
   if (session.twilioConn) {
     session.twilioConn.close();
     session.twilioConn = undefined;
+  }
+  if (session.vonageConn) {
+    session.vonageConn.close();
+    session.vonageConn = undefined;
   }
   if (session.modelConn) {
     session.modelConn.close();
@@ -405,6 +485,26 @@ function closeAllConnections() {
   session.responseStartTimestamp = undefined;
   session.latestMediaTimestamp = undefined;
   session.saved_config = undefined;
+  deleteSessionIfEmpty(sessionId);
+}
+
+function handleVonageMessage(sessionId: string, data: RawData) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  // For Vonage websocket, assume raw binary audio frames (16-bit PCM).
+  // We forward them directly to OpenAI as base64-encoded pcm16.
+
+  if (!isOpen(session.modelConn)) return;
+
+  const isBinary = Buffer.isBuffer(data);
+  const audioBuf: Buffer = isBinary ? (data as Buffer) : Buffer.from(data.toString(), "binary");
+
+  const base64Audio = audioBuf.toString("base64");
+
+  jsonSend(session.modelConn, {
+    type: "input_audio_buffer.append",
+    audio: base64Audio,
+  });
 }
 
 async function fetchRemoteAgentConfig(agentCode: string,customerId:string,sessionId:string): Promise<any> {
@@ -583,4 +683,19 @@ function jsonSend(ws: WebSocket | undefined, obj: unknown) {
 
 function isOpen(ws?: WebSocket): ws is WebSocket {
   return !!ws && ws.readyState === WebSocket.OPEN;
+}
+
+export function getSessionsSummary() {
+  const result: any[] = [];
+  for (const [id, s] of sessions.entries()) {
+    result.push({
+      id,
+      hasTwilio: !!s.twilioConn,
+      hasVonage: !!s.vonageConn,
+      hasFrontend: !!s.frontendConn,
+      hasModel: !!s.modelConn,
+      streamSid: s.streamSid,
+    });
+  }
+  return result;
 }

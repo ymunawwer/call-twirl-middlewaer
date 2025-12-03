@@ -12,6 +12,8 @@ import {
   handleCallConnection,
   handleFrontendConnection,
   invalidateAgentConfig,
+  handleVonageConnection,
+  getSessionsSummary,
 } from "./sessionManager";
 import functions from "./functionHandlers";
 
@@ -89,34 +91,82 @@ app.all("/twiml", async (req, res) => {
   res.type("text/xml").send(twimlContent);
 });
 
+app.all("/vonage/ncco", async (req, res) => {
+  const wsUrl = new URL(PUBLIC_URL);
+  wsUrl.protocol = "wss:";
+  wsUrl.pathname = `/vonage-call`;
+  const sessionId = (req.query.session_id as string) || "session-default";
+  const customer = (req.query.customer as string) || "customer-default";
+  const agentCode = (req.query.code as string) || "agent-code-default";
+
+  wsUrl.searchParams.set("session_id", sessionId);
+  wsUrl.searchParams.set("customer", customer);
+  wsUrl.searchParams.set("code", agentCode.toString());
+
+  const ncco = [
+    {
+      action: "talk",
+      text: "Please wait while we connect you to the AI assistant.",
+    },
+    {
+      action: "connect",
+      endpoint: [
+        {
+          type: "websocket",
+          uri: wsUrl.toString(),
+          "content-type": "audio/l16;rate=16000",
+          headers: {
+            session_id: sessionId,
+            customer,
+            code: agentCode.toString(),
+          },
+        },
+      ],
+    },
+  ];
+
+  res.json(ncco);
+});
+
 // New endpoint to list available tools (schemas)
 app.get("/tools", (req, res) => {
   res.json(functions.map((f) => f.schema));
 });
 
-let currentCall: WebSocket | null = null;
-let currentLogs: WebSocket | null = null;
+app.get("/sessions", (req, res) => {
+  res.json(getSessionsSummary());
+});
+
 //IncomingMessage
 wss.on("connection", (ws: WebSocket, req: any) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
   const parts = url.pathname.split("/").filter(Boolean);
-var FullURL = req;
-    console.log(FullURL);
+  var FullURL = req;
+  console.log(FullURL);
   if (parts.length < 1) {
     ws.close();
     return;
   }
 
   const type = parts[0];
+  const sessionId = url.searchParams.get("session_id") || "session-default";
+  const customer = url.searchParams.get("customer") || "customer-default";
+  const agentCode = url.searchParams.get("code") || "agent-code-default";
 
   if (type === "call") {
-    if (currentCall) currentCall.close();
-    currentCall = ws;
-    handleCallConnection(currentCall, OPENAI_API_KEY);
+    handleCallConnection(ws, OPENAI_API_KEY, {
+      sessionId,
+      customer,
+      code: agentCode,
+    });
+  } else if (type === "vonage-call") {
+    handleVonageConnection(ws, OPENAI_API_KEY, {
+      sessionId,
+      customer,
+      code: agentCode,
+    });
   } else if (type === "logs") {
-    if (currentLogs) currentLogs.close();
-    currentLogs = ws;
-    handleFrontendConnection(currentLogs);
+    handleFrontendConnection(ws, { sessionId });
   } else {
     ws.close();
   }
