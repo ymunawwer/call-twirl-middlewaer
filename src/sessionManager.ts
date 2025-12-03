@@ -128,7 +128,9 @@ export function handleCallConnection(
   openAIApiKey: string,
   meta: { sessionId: string; customer?: string; code?: string }
 ) {
+  console.log("[CALL] New Twilio call WebSocket connected meta",meta);
   const session = getOrCreateSession(meta.sessionId);
+  console.log("[CALL] New Twilio call WebSocket connected session",session);
   cleanupConnection(session.twilioConn);
   session.twilioConn = ws;
   session.openAIApiKey = openAIApiKey;
